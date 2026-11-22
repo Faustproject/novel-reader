@@ -173,8 +173,10 @@ body.practising #toast{bottom:auto;top:calc(70px + env(safe-area-inset-top))}
     <select id="optCVoice"><option value="coral">Coral（女・溫暖）</option><option value="nova">Nova（女・明亮）</option><option value="shimmer">Shimmer（女・柔和）</option><option value="sage">Sage（女・沉穩）</option><option value="fable">Fable（英式・說書）</option><option value="ballad">Ballad（男・抒情）</option><option value="ash">Ash（男・低沉）</option><option value="onyx">Onyx（男・厚實）</option><option value="echo">Echo（男・清晰）</option><option value="alloy">Alloy（中性）</option></select>
   </label>
   <label>語氣
-    <select id="optCStyle"><option value="story">有聲書（自然有感情）</option><option value="drama">戲劇化（情緒更強）</option><option value="calm">平靜（睡前）</option><option value="teach">清楚慢讀（學發音）</option></select>
+    <select id="optCStyle"><option value="story">有聲書（自然有感情）</option><option value="soft">柔美（輕柔、帶氣音、深情）</option><option value="drama">戲劇化（情緒更強）</option><option value="calm">平靜（睡前）</option><option value="teach">清楚慢讀（學發音）</option></select>
   </label>
+  <textarea id="optCCustom" rows="3" placeholder="自訂語氣（選填，英文描述效果最好）。填了就取代上面的語氣，例如：A young woman with a soft, breathy, wistful voice…"
+    style="width:100%;font:inherit;font-size:16px;padding:6px 8px;margin:4px 0 8px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--ink);resize:vertical"></textarea>
   <div style="color:var(--muted);font-size:12px;line-height:1.6">啟用後，朗讀與示範的句子會送到 OpenAI 合成語音，依用量計費。金鑰只存在這台裝置。失敗時自動改用內建語音。</div>
   <button id="diagTest">🔊 測試語音</button>
   <div id="diag"></div>
@@ -219,8 +221,8 @@ const store = {
   get(k, d){ try{ const v = localStorage.getItem(k); return v == null ? d : JSON.parse(v); }catch(e){ return d; } },
   set(k, v){ try{ localStorage.setItem(k, JSON.stringify(v)); }catch(e){} }
 };
-const settings = Object.assign({autoSpeak:true, accent:'us', zh:true, fontSize:19, rate:0.85, recWithSR: !IOS, voice:{}, cloudOn:false, cloudKey:'', cloudVoice:'coral', cloudStyle:'story'}, store.get('nr:settings', {}));
-const APP_VERSION = '1.3';
+const settings = Object.assign({autoSpeak:true, accent:'us', zh:true, fontSize:19, rate:0.85, recWithSR: !IOS, voice:{}, cloudOn:false, cloudKey:'', cloudVoice:'coral', cloudStyle:'story', cloudCustom:''}, store.get('nr:settings', {}));
+const APP_VERSION = '1.4';
 const STANDALONE = navigator.standalone === true || (window.matchMedia && matchMedia('(display-mode: standalone)').matches);
 const diag = {tts: '未測'};
 let toastTimer = 0;
@@ -232,7 +234,7 @@ function applySettings(){
   $('optZh').checked = settings.zh;
   $('optRec').checked = !!settings.recWithSR;
   $('optCloud').checked = !!settings.cloudOn; $('optKey').value = settings.cloudKey || '';
-  $('optCVoice').value = settings.cloudVoice; $('optCStyle').value = settings.cloudStyle;
+  $('optCVoice').value = settings.cloudVoice; $('optCStyle').value = settings.cloudStyle; $('optCCustom').value = settings.cloudCustom || '';
   $('optRate').value = String(settings.rate);
   $('reader').style.fontSize = settings.fontSize + 'px';
 }
@@ -246,6 +248,7 @@ $('optCloud').onchange = e => { settings.cloudOn = e.target.checked; cloudOff = 
 $('optKey').onchange = e => { settings.cloudKey = e.target.value.trim(); cloudOff = false; saveSettings(); showDiag(); };
 $('optCVoice').onchange = e => { settings.cloudVoice = e.target.value; saveSettings(); };
 $('optCStyle').onchange = e => { settings.cloudStyle = e.target.value; saveSettings(); };
+$('optCCustom').onchange = e => { settings.cloudCustom = e.target.value.trim(); saveSettings(); };
 $('smaller').onclick = () => { settings.fontSize = Math.max(14, settings.fontSize - 1); saveSettings(); applySettings(); };
 $('bigger').onclick = () => { settings.fontSize = Math.min(32, settings.fontSize + 1); saveSettings(); applySettings(); };
 $('gear').onclick = e => {
@@ -469,6 +472,7 @@ let audio = null, lastCancel = 0, sayTimer = 0;
 const CLOUD_URL = 'https://api.openai.com/v1/audio/speech', CLOUD_MODEL = 'gpt-4o-mini-tts';
 const SILENT = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=';
 const STYLES = {
+  soft: 'You are a young woman with a soft, delicate, slightly breathy voice, reading a novel aloud to someone you love. Speak tenderly and intimately, with a gentle, wistful, romantic feeling; let phrases rise and fall like a quiet melody, with small pauses and sighs of emotion. Dialogue should sound heartfelt and alive, never flat.',
   story: 'You are a warm, engaging audiobook narrator reading a novel aloud. Read with natural emotion and lively, human expression. Give lines of dialogue an in-character delivery that fits the speaker and the mood; let narration breathe, with varied pace and intonation. Never sound flat or robotic.',
   drama: 'You are a theatrical voice actor performing a novel. Be vivid and emotionally intense: act out dialogue in character, build tension and release, vary volume, pace and pitch boldly to match the scene.',
   calm: 'You are a gentle bedtime-story narrator. Read softly, warmly and unhurriedly, with tender, soothing expression.',
@@ -482,14 +486,15 @@ function cloudStop(){
   if(cAudio){ cAudio.onended = cAudio.onerror = null; try{ cAudio.pause(); }catch(e){} }
 }
 function cloudGet(text){                          // 回傳 Promise<blob URL>；同一句只合成一次
-  const k = [settings.cloudVoice, settings.cloudStyle, settings.accent, text].join('|');
+  const style = settings.cloudCustom || STYLES[settings.cloudStyle] || STYLES.story;
+  const k = [settings.cloudVoice, style, settings.accent, text].join('|');
   if(cCache.has(k)) return cCache.get(k);
   const pr = (async () => {
     const r = await fetch(CLOUD_URL, {
       method: 'POST',
       headers: {'Authorization': 'Bearer ' + settings.cloudKey, 'Content-Type': 'application/json'},
       body: JSON.stringify({model: CLOUD_MODEL, voice: settings.cloudVoice, input: text, response_format: 'mp3',
-        instructions: (STYLES[settings.cloudStyle] || STYLES.story) + (settings.accent === 'uk' ? ' Speak with a British accent.' : ' Speak with an American accent.')})
+        instructions: style + (settings.accent === 'uk' ? ' Speak with a British accent.' : ' Speak with an American accent.')})
     });
     if(!r.ok){ const e = new Error('HTTP ' + r.status); e.status = r.status; throw e; }
     return URL.createObjectURL(await r.blob());
