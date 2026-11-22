@@ -1,6 +1,6 @@
 /* App 外殼離線快取；字典與翻譯一律走網路（查過的字另存一份，離線時可回看） */
-const VERSION = 'nr-v6';
-const SHELL = ['./', 'index.html', 'manifest.webmanifest', 'vendor/pdf.min.js', 'vendor/pdf.worker.min.js',
+const VERSION = 'nr-v7';
+const SHELL = ['./', 'index.html', 'manifest.webmanifest', 'vendor/pdf.min.js', 'vendor/pdf.worker.min.js', 'tts-worker.js',
   'icons/icon-180.png', 'icons/icon-192.png', 'icons/icon-512.png'];
 const API = ['api.dictionaryapi.dev', 'api.mymemory.translated.net'];
 

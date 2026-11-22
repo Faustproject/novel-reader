@@ -165,7 +165,13 @@ body.practising #toast{bottom:auto;top:calc(70px + env(safe-area-inset-top))}
   </label>
   <label>顯示中文翻譯 <input id="optZh" type="checkbox"></label>
   <label>跟讀時同時錄音 <input id="optRec" type="checkbox"></label>
-  <h3 style="margin-top:12px;padding-top:10px;border-top:1px solid var(--line)">雲端真人語音（選用）</h3>
+  <h3 style="margin-top:12px;padding-top:10px;border-top:1px solid var(--line)">免費離線真人語音（實驗）</h3>
+  <label>啟用 <input id="optLocal" type="checkbox"></label>
+  <label>聲音
+    <select id="optLVoice"><option value="af_nicole">Nicole（輕柔氣音）</option><option value="af_heart">Heart（溫暖自然）</option><option value="af_bella">Bella（明亮有活力）</option><option value="af_sarah">Sarah（沉穩）</option><option value="af_aoede">Aoede（柔和）</option><option value="af_sky">Sky（年輕）</option><option value="bf_emma">Emma（英式）</option><option value="bf_isabella">Isabella（英式）</option><option value="bf_lily">Lily（英式・輕柔）</option></select>
+  </label>
+  <div style="color:var(--muted);font-size:12px;line-height:1.6">不用金鑰、不花錢，句子不外傳。第一次啟用要下載約 90MB 語音模型（請用 Wi-Fi），之後可離線。語音在裝置上運算，每句開始前可能要等幾秒。</div>
+  <h3 style="margin-top:12px;padding-top:10px;border-top:1px solid var(--line)">雲端真人語音（選用・需付費金鑰）</h3>
   <label>啟用 <input id="optCloud" type="checkbox"></label>
   <input id="optKey" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="OpenAI API 金鑰（sk-…）"
     style="width:100%;font:inherit;font-size:16px;padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--ink)">
@@ -221,9 +227,9 @@ const store = {
   get(k, d){ try{ const v = localStorage.getItem(k); return v == null ? d : JSON.parse(v); }catch(e){ return d; } },
   set(k, v){ try{ localStorage.setItem(k, JSON.stringify(v)); }catch(e){} }
 };
-const settings = Object.assign({autoSpeak:true, accent:'us', zh:true, fontSize:19, rate:0.85, recWithSR: !IOS, voice:{}, cloudOn:false, cloudKey:'', cloudVoice:'shimmer', cloudStyle:'soft', cloudCustom:''}, store.get('nr:settings', {}));
+const settings = Object.assign({autoSpeak:true, accent:'us', zh:true, fontSize:19, rate:0.85, recWithSR: !IOS, voice:{}, cloudOn:false, cloudKey:'', cloudVoice:'shimmer', cloudStyle:'soft', cloudCustom:'', localOn:false, localVoice:'af_nicole'}, store.get('nr:settings', {}));
 if(settings.presetV !== 2){ settings.presetV = 2; settings.cloudVoice = 'shimmer'; settings.cloudStyle = 'soft'; settings.cloudCustom = ''; store.set('nr:settings', settings); }   // 一次性：把預設換成柔美女聲
-const APP_VERSION = '1.5';
+const APP_VERSION = '1.6';
 const STANDALONE = navigator.standalone === true || (window.matchMedia && matchMedia('(display-mode: standalone)').matches);
 const diag = {tts: '未測'};
 let toastTimer = 0;
@@ -234,6 +240,7 @@ function applySettings(){
   $('optAccent').value = settings.accent;
   $('optZh').checked = settings.zh;
   $('optRec').checked = !!settings.recWithSR;
+  $('optLocal').checked = !!settings.localOn; $('optLVoice').value = settings.localVoice;
   $('optCloud').checked = !!settings.cloudOn; $('optKey').value = settings.cloudKey || '';
   $('optCVoice').value = settings.cloudVoice; $('optCStyle').value = settings.cloudStyle; $('optCCustom').value = settings.cloudCustom || '';
   $('optRate').value = String(settings.rate);
@@ -245,6 +252,8 @@ $('optAccent').onchange = e => { settings.accent = e.target.value; saveSettings(
 $('optVoice').onchange = e => { settings.voice[settings.accent] = e.target.value; saveSettings(); fillVoices(); stopSound(); say('This is how I sound when I read to you.', settings.rate); };
 $('optZh').onchange = e => { settings.zh = e.target.checked; saveSettings(); };
 $('optRec').onchange = e => { settings.recWithSR = e.target.checked; saveSettings(); };
+$('optLocal').onchange = e => { settings.localOn = e.target.checked; localOff = false; saveSettings(); if(settings.localOn) localLoad(); showDiag(); };
+$('optLVoice').onchange = e => { settings.localVoice = e.target.value; saveSettings(); if(localReady()){ stopSound(); say('This is how I sound when I read to you.', settings.rate); } };
 $('optCloud').onchange = e => { settings.cloudOn = e.target.checked; cloudOff = false; saveSettings(); showDiag(); };
 $('optKey').onchange = e => { settings.cloudKey = e.target.value.trim(); cloudOff = false; saveSettings(); showDiag(); };
 $('optCVoice').onchange = e => { settings.cloudVoice = e.target.value; saveSettings(); };
@@ -482,15 +491,43 @@ const STYLES = {
 let cAudio = null, cToken = 0, cloudOff = false;
 const cCache = new Map();
 const cloudReady = () => !!(settings.cloudOn && settings.cloudKey && !cloudOff);
+/* 免費離線神經語音：在 Web Worker 裡運算，不卡畫面 */
+let lWorker = null, lSeq = 0, localOff = false, lState = '未載入';
+const lWait = new Map();
+const localReady = () => !!(settings.localOn && !localOff && window.Worker);
+const neuralReady = () => cloudReady() || localReady();
+function localWorker(){
+  if(lWorker) return lWorker;
+  lWorker = new Worker('tts-worker.js', {type: 'module'});
+  lWorker.onmessage = e => {
+    const m = e.data;
+    if(m.type === 'progress'){ lState = '下載中 ' + m.pct + '%'; toast('下載語音模型 ' + m.pct + '%（只需一次）', 4000); }
+    else if(m.type === 'ready'){ lState = '就緒'; toast('離線語音已就緒。', 2500); }
+    else if(m.type === 'audio'){ const w = lWait.get(m.id); lWait.delete(m.id); if(w) w.res(URL.createObjectURL(new Blob([m.buf], {type: 'audio/wav'}))); }
+    else if(m.type === 'error'){ const w = lWait.get(m.id); lWait.delete(m.id); const er = new Error(m.message); er.local = true; if(w) w.rej(er); else { lState = '失敗：' + m.message; localOff = true; toast('離線語音載入失敗：' + m.message, 8000); } }
+  };
+  lWorker.onerror = e => { lState = '失敗：' + (e.message || 'worker'); localOff = true; for(const w of lWait.values()){ const er = new Error('無法啟動'); er.local = true; w.rej(er); } lWait.clear(); };
+  return lWorker;
+}
+function localLoad(){ try{ if(lState === '未載入') lState = '載入中'; localWorker().postMessage({type: 'load'}); }catch(e){ localOff = true; lState = '失敗：' + e.message; } }
+function localGet(text){
+  return new Promise((res, rej) => {
+    const id = ++lSeq; lWait.set(id, {res, rej});
+    try{ localWorker().postMessage({type: 'gen', id, text, voice: settings.localVoice}); }
+    catch(e){ lWait.delete(id); e.local = true; rej(e); }
+  });
+}
+if(settings.localOn) setTimeout(localLoad, 1500);    // 開啟 App 時先在背景載入模型
 function cloudStop(){
   cToken++;
   if(cAudio){ cAudio.onended = cAudio.onerror = null; try{ cAudio.pause(); }catch(e){} }
 }
 function cloudGet(text){                          // 回傳 Promise<blob URL>；同一句只合成一次
+  const useLocal = !cloudReady();
   const style = settings.cloudCustom || STYLES[settings.cloudStyle] || STYLES.story;
-  const k = [settings.cloudVoice, style, settings.accent, text].join('|');
+  const k = useLocal ? ['L', settings.localVoice, text].join('|') : [settings.cloudVoice, style, settings.accent, text].join('|');
   if(cCache.has(k)) return cCache.get(k);
-  const pr = (async () => {
+  const pr = useLocal ? localGet(text) : (async () => {
     const r = await fetch(CLOUD_URL, {
       method: 'POST',
       headers: {'Authorization': 'Bearer ' + settings.cloudKey, 'Content-Type': 'application/json'},
@@ -508,25 +545,29 @@ function cloudGet(text){                          // 回傳 Promise<blob URL>；
 function cloudSay(text, rate, onend){
   if(!cAudio){ cAudio = new Audio(); cAudio.preload = 'auto'; }
   if(!cloudSay._unlocked){ cloudSay._unlocked = true; cAudio.src = SILENT; const u = cAudio.play(); if(u) u.catch(() => {}); }   // 在使用者點按當下解鎖，之後才能自動接續播放
-  const token = ++cToken, a = cAudio;
+  const token = ++cToken, a = cAudio, isLocal = !cloudReady();
+  let slow = setTimeout(() => { if(token === cToken && !done) toast(isLocal ? '語音運算中…' : '語音合成中…', 4000); }, 1500);
   let done = false;
   const fin = err => { if(done) return; done = true; if(onend) onend(err); };
   const fallback = (why, hard) => {
     if(token !== cToken) return;
     a.onended = a.onerror = null;
-    diag.cloud = '失敗：' + why; if(hard) cloudOff = true;
-    toast('雲端語音失敗（' + why + '），改用內建語音。');
+    if(isLocal){ lState = '失敗：' + why; if(hard) localOff = true; } else { diag.cloud = '失敗：' + why; if(hard) cloudOff = true; }
+    toast((isLocal ? '離線語音' : '雲端語音') + '失敗（' + why + '），改用內建語音。');
     done = true; if(!sayLocal(text, rate, onend)){ done = false; fin('cloud'); }
   };
   cloudGet(text).then(url => {
+    clearTimeout(slow);
     if(token !== cToken) return;
     a.onended = () => { if(token === cToken) fin(); };
     a.onerror = () => fallback('無法播放');
     a.src = url; a.defaultPlaybackRate = rate; a.playbackRate = rate;
     const pr = a.play();
-    if(pr) pr.then(() => { diag.cloud = '正常'; }).catch(e => fallback(e && e.name === 'NotAllowedError' ? '系統擋下自動播放，請再按一次' : '無法播放'));
+    if(pr) pr.then(() => { if(isLocal) lState = '正常'; else diag.cloud = '正常'; }).catch(e => fallback(e && e.name === 'NotAllowedError' ? '系統擋下自動播放，請再按一次' : '無法播放'));
   }).catch(e => {
+    clearTimeout(slow);
     const s = e && e.status;
+    if(e && e.local){ fallback(e.message || '運算失敗', /import|fetch|load|memory|啟動/i.test(e.message || '')); return; }
     fallback(s === 401 ? '金鑰無效' : s === 429 ? '額度用完或請求太頻繁' : s === 403 ? '金鑰沒有語音合成權限' : s ? '服務回應 ' + s : '連不上服務', s === 401 || s === 403 || s === 429);
   });
   return true;
@@ -577,7 +618,7 @@ function fillVoices(){
   if(IOS && basic) tip.textContent = '目前是基本語音（機械音）。到 iPhone「設定 › 輔助使用 › 語音內容 › 聲音 › 英文」下載標示「高品質」或「優化」的語音（如 Ava、Zoe），重開 App 後在這裡選 ★ 的語音。';
 }
 function say(text, rate, onend){
-  if(cloudReady() && /\s/.test(text.trim())) return cloudSay(text, rate, onend);   // 單字仍用字典錄音／內建語音，省費用也較快
+  if(neuralReady() && /\s/.test(text.trim())) return cloudSay(text, rate, onend);   // 單字仍用字典錄音／內建語音，省費用也較快
   return sayLocal(text, rate, onend);
 }
 function sayLocal(text, rate, onend){
@@ -655,7 +696,7 @@ async function readNext(){
     if(err){ stopReading(); return; }             // 語音出錯就停下，不要一路翻頁
     readIdx++; readNext();
   });
-  if(cloudReady() && sentences[readIdx + 1]) cloudGet(sentences[readIdx + 1].text).catch(() => {});   // 先合成下一句，減少句間停頓
+  if(neuralReady() && sentences[readIdx + 1]) cloudGet(sentences[readIdx + 1].text).catch(() => {});   // 先合成下一句，減少句間停頓
 }
 function stopReading(){                           // 暫停：保留 readIdx，下次從同一句繼續
   if(!reading) return;
@@ -845,6 +886,7 @@ function showDiag(){
   const v = pickVoice();
   $('diag').textContent = '版本 ' + APP_VERSION + '｜' + (STANDALONE ? '主畫面 App' : '瀏覽器分頁') +
     '｜朗讀：' + (window.speechSynthesis ? '有（語音 ' + voices.length + ' 個，使用 ' + (v ? v.name : '系統預設') + '，狀態 ' + diag.tts + '）' : '無') +
+    '｜離線神經語音：' + (settings.localOn ? lState : '未啟用') +
     '｜雲端：' + (settings.cloudOn ? (settings.cloudKey ? (cloudOff ? '已停用（' + (diag.cloud || '') + '）' : (diag.cloud || '未測')) : '未填金鑰') : '未啟用') +
     '｜辨識：' + (SR ? (srBroken ? '有但失敗' : '有') : '無') + '｜錄音：' + (canRec ? '有' : '無');
 }
