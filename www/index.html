@@ -173,7 +173,7 @@ body.practising #toast{bottom:auto;top:calc(70px + env(safe-area-inset-top))}
     <select id="optCVoice"><option value="coral">Coral（女・溫暖）</option><option value="nova">Nova（女・明亮）</option><option value="shimmer">Shimmer（女・柔和）</option><option value="sage">Sage（女・沉穩）</option><option value="fable">Fable（英式・說書）</option><option value="ballad">Ballad（男・抒情）</option><option value="ash">Ash（男・低沉）</option><option value="onyx">Onyx（男・厚實）</option><option value="echo">Echo（男・清晰）</option><option value="alloy">Alloy（中性）</option></select>
   </label>
   <label>語氣
-    <select id="optCStyle"><option value="story">有聲書（自然有感情）</option><option value="soft">柔美（輕柔、帶氣音、深情）</option><option value="drama">戲劇化（情緒更強）</option><option value="calm">平靜（睡前）</option><option value="teach">清楚慢讀（學發音）</option></select>
+    <select id="optCStyle"><option value="soft">柔美（輕柔、空靈、深情浪漫）</option><option value="story">有聲書（自然有感情）</option><option value="drama">戲劇化（情緒更強）</option><option value="calm">平靜（睡前）</option><option value="teach">清楚慢讀（學發音）</option></select>
   </label>
   <textarea id="optCCustom" rows="3" placeholder="自訂語氣（選填，英文描述效果最好）。填了就取代上面的語氣，例如：A young woman with a soft, breathy, wistful voice…"
     style="width:100%;font:inherit;font-size:16px;padding:6px 8px;margin:4px 0 8px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--ink);resize:vertical"></textarea>
@@ -221,8 +221,9 @@ const store = {
   get(k, d){ try{ const v = localStorage.getItem(k); return v == null ? d : JSON.parse(v); }catch(e){ return d; } },
   set(k, v){ try{ localStorage.setItem(k, JSON.stringify(v)); }catch(e){} }
 };
-const settings = Object.assign({autoSpeak:true, accent:'us', zh:true, fontSize:19, rate:0.85, recWithSR: !IOS, voice:{}, cloudOn:false, cloudKey:'', cloudVoice:'coral', cloudStyle:'story', cloudCustom:''}, store.get('nr:settings', {}));
-const APP_VERSION = '1.4';
+const settings = Object.assign({autoSpeak:true, accent:'us', zh:true, fontSize:19, rate:0.85, recWithSR: !IOS, voice:{}, cloudOn:false, cloudKey:'', cloudVoice:'shimmer', cloudStyle:'soft', cloudCustom:''}, store.get('nr:settings', {}));
+if(settings.presetV !== 2){ settings.presetV = 2; settings.cloudVoice = 'shimmer'; settings.cloudStyle = 'soft'; settings.cloudCustom = ''; store.set('nr:settings', settings); }   // 一次性：把預設換成柔美女聲
+const APP_VERSION = '1.5';
 const STANDALONE = navigator.standalone === true || (window.matchMedia && matchMedia('(display-mode: standalone)').matches);
 const diag = {tts: '未測'};
 let toastTimer = 0;
@@ -472,7 +473,7 @@ let audio = null, lastCancel = 0, sayTimer = 0;
 const CLOUD_URL = 'https://api.openai.com/v1/audio/speech', CLOUD_MODEL = 'gpt-4o-mini-tts';
 const SILENT = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=';
 const STYLES = {
-  soft: 'You are a young woman with a soft, delicate, slightly breathy voice, reading a novel aloud to someone you love. Speak tenderly and intimately, with a gentle, wistful, romantic feeling; let phrases rise and fall like a quiet melody, with small pauses and sighs of emotion. Dialogue should sound heartfelt and alive, never flat.',
+  soft: 'You are a young woman with a soft, airy, wistful voice, tender and romantic, reading a novel aloud to someone you love. Keep the voice light, breathy and intimate, never loud or harsh. Let phrases rise and fall gently like a quiet melody, with small pauses and soft sighs of feeling. Give dialogue a heartfelt, in-character delivery so every line sounds alive and full of emotion, never flat.',
   story: 'You are a warm, engaging audiobook narrator reading a novel aloud. Read with natural emotion and lively, human expression. Give lines of dialogue an in-character delivery that fits the speaker and the mood; let narration breathe, with varied pace and intonation. Never sound flat or robotic.',
   drama: 'You are a theatrical voice actor performing a novel. Be vivid and emotionally intense: act out dialogue in character, build tension and release, vary volume, pace and pitch boldly to match the scene.',
   calm: 'You are a gentle bedtime-story narrator. Read softly, warmly and unhurriedly, with tender, soothing expression.',
