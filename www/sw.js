@@ -1,5 +1,5 @@
 /* App 外殼離線快取；字典與翻譯一律走網路（查過的字另存一份，離線時可回看） */
-const VERSION = 'nr-v1';
+const VERSION = 'nr-v2';
 const SHELL = ['./', 'index.html', 'manifest.webmanifest', 'vendor/pdf.min.js', 'vendor/pdf.worker.min.js',
   'icons/icon-180.png', 'icons/icon-192.png', 'icons/icon-512.png'];
 const API = ['api.dictionaryapi.dev', 'api.mymemory.translated.net'];
@@ -17,11 +17,14 @@ self.addEventListener('fetch', e => {
   if(req.method !== 'GET') return;
   const url = new URL(req.url);
   if(url.origin === location.origin){
-    // 外殼：先回快取，背景更新（下次開啟即為新版）
     e.respondWith(caches.open(VERSION).then(async c => {
       const hit = await c.match(req, {ignoreSearch: true});
-      const net = fetch(req).then(r => { if(r.ok) c.put(req, r.clone()); return r; }).catch(() => hit);
-      return hit || net;
+      const net = fetch(req).then(r => { if(r.ok) c.put(req, r.clone()); return r; });
+      if(req.mode === 'navigate' || /(index\.html|\/)$/.test(url.pathname)){
+        // 頁面本身：網路優先（3 秒內沒回應就用快取），改版後立即生效
+        return Promise.race([net, new Promise((_, rej) => setTimeout(rej, 3000))]).catch(() => hit || net);
+      }
+      return hit || net.catch(() => hit);          // 其餘外殼檔：快取優先，背景更新
     }));
   }else if(API.includes(url.hostname)){
     // 字典／翻譯：網路優先，失敗才用上次查過的結果
