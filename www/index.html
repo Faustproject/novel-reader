@@ -158,6 +158,8 @@ body.practising #toast{bottom:auto;top:calc(70px + env(safe-area-inset-top))}
   <label>口音
     <select id="optAccent"><option value="us">美式</option><option value="uk">英式</option></select>
   </label>
+  <label>語音 <select id="optVoice" style="max-width:150px"></select></label>
+  <div id="voiceTip" style="display:none;color:var(--warn);font-size:12px;line-height:1.6;padding-bottom:6px"></div>
   <label>朗讀速度
     <select id="optRate"><option value="0.7">慢</option><option value="0.85">稍慢</option><option value="1">正常</option><option value="1.15">快</option></select>
   </label>
@@ -206,8 +208,8 @@ const store = {
   get(k, d){ try{ const v = localStorage.getItem(k); return v == null ? d : JSON.parse(v); }catch(e){ return d; } },
   set(k, v){ try{ localStorage.setItem(k, JSON.stringify(v)); }catch(e){} }
 };
-const settings = Object.assign({autoSpeak:true, accent:'us', zh:true, fontSize:19, rate:0.85, recWithSR: !IOS}, store.get('nr:settings', {}));
-const APP_VERSION = '1.1';
+const settings = Object.assign({autoSpeak:true, accent:'us', zh:true, fontSize:19, rate:0.85, recWithSR: !IOS, voice:{}}, store.get('nr:settings', {}));
+const APP_VERSION = '1.2';
 const STANDALONE = navigator.standalone === true || (window.matchMedia && matchMedia('(display-mode: standalone)').matches);
 const diag = {tts: '未測'};
 let toastTimer = 0;
@@ -223,12 +225,18 @@ function applySettings(){
 }
 $('optRate').onchange = e => { settings.rate = parseFloat(e.target.value) || 0.85; saveSettings(); };
 $('optSpeak').onchange = e => { settings.autoSpeak = e.target.checked; saveSettings(); if(!settings.autoSpeak) stopSound(); };
-$('optAccent').onchange = e => { settings.accent = e.target.value; saveSettings(); };
+$('optAccent').onchange = e => { settings.accent = e.target.value; saveSettings(); fillVoices(); };
+$('optVoice').onchange = e => { settings.voice[settings.accent] = e.target.value; saveSettings(); fillVoices(); stopSound(); say('This is how I sound when I read to you.', settings.rate); };
 $('optZh').onchange = e => { settings.zh = e.target.checked; saveSettings(); };
 $('optRec').onchange = e => { settings.recWithSR = e.target.checked; saveSettings(); };
 $('smaller').onclick = () => { settings.fontSize = Math.max(14, settings.fontSize - 1); saveSettings(); applySettings(); };
 $('bigger').onclick = () => { settings.fontSize = Math.min(32, settings.fontSize + 1); saveSettings(); applySettings(); };
-$('gear').onclick = e => { e.stopPropagation(); $('settings').classList.toggle('open'); showDiag(); };
+$('gear').onclick = e => {
+  e.stopPropagation();
+  const s = $('settings'), top = document.querySelector('header').getBoundingClientRect().bottom + 6;   // 開在工具列下方，不蓋住按鈕
+  s.style.top = top + 'px'; s.style.maxHeight = 'calc(100vh - ' + (top + 12) + 'px)'; s.style.overflowY = 'auto';
+  s.classList.toggle('open'); showDiag();
+};
 $('settings').onclick = e => e.stopPropagation();
 applySettings();
 
@@ -451,15 +459,38 @@ function stopSound(){
 }
 let voices = [];
 function loadVoices(){ if(window.speechSynthesis) voices = speechSynthesis.getVoices() || []; }
-if(window.speechSynthesis){ loadVoices(); speechSynthesis.onvoiceschanged = loadVoices; }
+if(window.speechSynthesis){ loadVoices(); speechSynthesis.onvoiceschanged = () => { loadVoices(); if($('settings').classList.contains('open')) fillVoices(); }; }
 const speechLang = () => settings.accent === 'uk' ? 'en-GB' : 'en-US';
+/* 語音品質：Premium（高品質）> Enhanced（優化）> 基本（機械音）。搞怪語音一律排除 */
+const JUNK = /^(Albert|Bad News|Bahh|Bells|Boing|Bubbles|Cellos|Good News|Jester|Organ|Superstar|Trinoids|Whisper|Wobble|Zarvox|Fred|Junior|Kathy|Ralph|Eddy|Flo|Grandma|Grandpa|Reed|Rocko|Sandy|Shelley)\b/i;
+const vq = v => /premium|高品質|高音質/i.test(v.name) ? 0 : /enhanced|natural|優化|增強/i.test(v.name) ? 1 : 2;
+function langVoices(){
+  return voices.filter(v => (v.lang || '').replace('_', '-') === speechLang() && !JUNK.test(v.name))
+    .map((v, i) => ({v, i})).sort((x, y) => vq(x.v) - vq(y.v) || x.i - y.i).map(x => x.v);
+}
 function pickVoice(){
-  const c = voices.filter(v => (v.lang || '').replace('_', '-') === speechLang());
-  if(IOS){   // iOS 的清單含大量搞怪語音，只挑已知的正常語音，否則交給系統依語言決定
+  const c = langVoices();
+  const chosen = settings.voice && settings.voice[settings.accent];
+  const hit = chosen && c.find(v => v.name === chosen);
+  if(hit) return hit;
+  if(c[0] && vq(c[0]) < 2) return c[0];              // 有下載高品質語音就優先用
+  if(IOS){
     const want = settings.accent === 'uk' ? /^(Daniel|Kate|Serena|Arthur|Martha)/ : /^(Samantha|Ava|Allison|Susan|Evan|Nathan|Zoe|Tom)/;
-    return c.find(v => want.test(v.name) && /premium|enhanced/i.test(v.name)) || c.find(v => want.test(v.name)) || null;
+    return c.find(v => want.test(v.name)) || null;
   }
-  return c.find(v => /natural/i.test(v.name)) || c.find(v => /google/i.test(v.name)) || c[0] || null;
+  return c.find(v => /google/i.test(v.name)) || c[0] || null;
+}
+function fillVoices(){
+  loadVoices();
+  const sel = $('optVoice'), c = langVoices(), cur = pickVoice();
+  sel.innerHTML = '';
+  const o0 = document.createElement('option'); o0.value = ''; o0.textContent = '自動' + (cur && !(settings.voice[settings.accent]) ? '（' + cur.name + '）' : ''); sel.appendChild(o0);
+  for(const v of c){ const o = document.createElement('option'); o.value = v.name; o.textContent = (vq(v) === 0 ? '★★ ' : vq(v) === 1 ? '★ ' : '') + v.name; sel.appendChild(o); }
+  const chosen = settings.voice[settings.accent] || '';
+  sel.value = c.some(v => v.name === chosen) ? chosen : '';
+  const tip = $('voiceTip'), basic = !cur || vq(cur) === 2;
+  tip.style.display = IOS && basic ? 'block' : 'none';
+  if(IOS && basic) tip.textContent = '目前是基本語音（機械音）。到 iPhone「設定 › 輔助使用 › 語音內容 › 聲音 › 英文」下載標示「高品質」或「優化」的語音（如 Ava、Zoe），重開 App 後在這裡選 ★ 的語音。';
 }
 function say(text, rate, onend){
   if(!window.speechSynthesis) return false;
@@ -721,7 +752,7 @@ $('pNext').onclick = () => openPractice(pIdx + 1);
 $('pClose').onclick = closePractice;
 $('prac').onclick = e => { e.stopPropagation(); openPractice(readIdx < sentences.length ? readIdx : 0); };
 function showDiag(){
-  loadVoices();
+  fillVoices();
   const v = pickVoice();
   $('diag').textContent = '版本 ' + APP_VERSION + '｜' + (STANDALONE ? '主畫面 App' : '瀏覽器分頁') +
     '｜朗讀：' + (window.speechSynthesis ? '有（語音 ' + voices.length + ' 個，使用 ' + (v ? v.name : '系統預設') + '，狀態 ' + diag.tts + '）' : '無') +
