@@ -165,6 +165,17 @@ body.practising #toast{bottom:auto;top:calc(70px + env(safe-area-inset-top))}
   </label>
   <label>顯示中文翻譯 <input id="optZh" type="checkbox"></label>
   <label>跟讀時同時錄音 <input id="optRec" type="checkbox"></label>
+  <h3 style="margin-top:12px;padding-top:10px;border-top:1px solid var(--line)">雲端真人語音（選用）</h3>
+  <label>啟用 <input id="optCloud" type="checkbox"></label>
+  <input id="optKey" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="OpenAI API 金鑰（sk-…）"
+    style="width:100%;font:inherit;font-size:16px;padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--ink)">
+  <label>聲音
+    <select id="optCVoice"><option value="coral">Coral（女・溫暖）</option><option value="nova">Nova（女・明亮）</option><option value="shimmer">Shimmer（女・柔和）</option><option value="sage">Sage（女・沉穩）</option><option value="fable">Fable（英式・說書）</option><option value="ballad">Ballad（男・抒情）</option><option value="ash">Ash（男・低沉）</option><option value="onyx">Onyx（男・厚實）</option><option value="echo">Echo（男・清晰）</option><option value="alloy">Alloy（中性）</option></select>
+  </label>
+  <label>語氣
+    <select id="optCStyle"><option value="story">有聲書（自然有感情）</option><option value="drama">戲劇化（情緒更強）</option><option value="calm">平靜（睡前）</option><option value="teach">清楚慢讀（學發音）</option></select>
+  </label>
+  <div style="color:var(--muted);font-size:12px;line-height:1.6">啟用後，朗讀與示範的句子會送到 OpenAI 合成語音，依用量計費。金鑰只存在這台裝置。失敗時自動改用內建語音。</div>
   <button id="diagTest">🔊 測試語音</button>
   <div id="diag"></div>
 </div>
@@ -208,8 +219,8 @@ const store = {
   get(k, d){ try{ const v = localStorage.getItem(k); return v == null ? d : JSON.parse(v); }catch(e){ return d; } },
   set(k, v){ try{ localStorage.setItem(k, JSON.stringify(v)); }catch(e){} }
 };
-const settings = Object.assign({autoSpeak:true, accent:'us', zh:true, fontSize:19, rate:0.85, recWithSR: !IOS, voice:{}}, store.get('nr:settings', {}));
-const APP_VERSION = '1.2';
+const settings = Object.assign({autoSpeak:true, accent:'us', zh:true, fontSize:19, rate:0.85, recWithSR: !IOS, voice:{}, cloudOn:false, cloudKey:'', cloudVoice:'coral', cloudStyle:'story'}, store.get('nr:settings', {}));
+const APP_VERSION = '1.3';
 const STANDALONE = navigator.standalone === true || (window.matchMedia && matchMedia('(display-mode: standalone)').matches);
 const diag = {tts: '未測'};
 let toastTimer = 0;
@@ -220,6 +231,8 @@ function applySettings(){
   $('optAccent').value = settings.accent;
   $('optZh').checked = settings.zh;
   $('optRec').checked = !!settings.recWithSR;
+  $('optCloud').checked = !!settings.cloudOn; $('optKey').value = settings.cloudKey || '';
+  $('optCVoice').value = settings.cloudVoice; $('optCStyle').value = settings.cloudStyle;
   $('optRate').value = String(settings.rate);
   $('reader').style.fontSize = settings.fontSize + 'px';
 }
@@ -229,6 +242,10 @@ $('optAccent').onchange = e => { settings.accent = e.target.value; saveSettings(
 $('optVoice').onchange = e => { settings.voice[settings.accent] = e.target.value; saveSettings(); fillVoices(); stopSound(); say('This is how I sound when I read to you.', settings.rate); };
 $('optZh').onchange = e => { settings.zh = e.target.checked; saveSettings(); };
 $('optRec').onchange = e => { settings.recWithSR = e.target.checked; saveSettings(); };
+$('optCloud').onchange = e => { settings.cloudOn = e.target.checked; cloudOff = false; saveSettings(); showDiag(); };
+$('optKey').onchange = e => { settings.cloudKey = e.target.value.trim(); cloudOff = false; saveSettings(); showDiag(); };
+$('optCVoice').onchange = e => { settings.cloudVoice = e.target.value; saveSettings(); };
+$('optCStyle').onchange = e => { settings.cloudStyle = e.target.value; saveSettings(); };
 $('smaller').onclick = () => { settings.fontSize = Math.max(14, settings.fontSize - 1); saveSettings(); applySettings(); };
 $('bigger').onclick = () => { settings.fontSize = Math.min(32, settings.fontSize + 1); saveSettings(); applySettings(); };
 $('gear').onclick = e => {
@@ -448,7 +465,68 @@ async function translate(w){
 
 /* ---------- 發音 ---------- */
 let audio = null, lastCancel = 0, sayTimer = 0;
+/* ---------- 雲端真人語音（選用）：句子 → OpenAI 語音合成 → <audio> 播放 ---------- */
+const CLOUD_URL = 'https://api.openai.com/v1/audio/speech', CLOUD_MODEL = 'gpt-4o-mini-tts';
+const SILENT = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=';
+const STYLES = {
+  story: 'You are a warm, engaging audiobook narrator reading a novel aloud. Read with natural emotion and lively, human expression. Give lines of dialogue an in-character delivery that fits the speaker and the mood; let narration breathe, with varied pace and intonation. Never sound flat or robotic.',
+  drama: 'You are a theatrical voice actor performing a novel. Be vivid and emotionally intense: act out dialogue in character, build tension and release, vary volume, pace and pitch boldly to match the scene.',
+  calm: 'You are a gentle bedtime-story narrator. Read softly, warmly and unhurriedly, with tender, soothing expression.',
+  teach: 'You are a friendly English teacher reading to a learner. Speak slowly and very clearly, articulating every word, but keep natural, expressive intonation and feeling.'
+};
+let cAudio = null, cToken = 0, cloudOff = false;
+const cCache = new Map();
+const cloudReady = () => !!(settings.cloudOn && settings.cloudKey && !cloudOff);
+function cloudStop(){
+  cToken++;
+  if(cAudio){ cAudio.onended = cAudio.onerror = null; try{ cAudio.pause(); }catch(e){} }
+}
+function cloudGet(text){                          // 回傳 Promise<blob URL>；同一句只合成一次
+  const k = [settings.cloudVoice, settings.cloudStyle, settings.accent, text].join('|');
+  if(cCache.has(k)) return cCache.get(k);
+  const pr = (async () => {
+    const r = await fetch(CLOUD_URL, {
+      method: 'POST',
+      headers: {'Authorization': 'Bearer ' + settings.cloudKey, 'Content-Type': 'application/json'},
+      body: JSON.stringify({model: CLOUD_MODEL, voice: settings.cloudVoice, input: text, response_format: 'mp3',
+        instructions: (STYLES[settings.cloudStyle] || STYLES.story) + (settings.accent === 'uk' ? ' Speak with a British accent.' : ' Speak with an American accent.')})
+    });
+    if(!r.ok){ const e = new Error('HTTP ' + r.status); e.status = r.status; throw e; }
+    return URL.createObjectURL(await r.blob());
+  })();
+  cCache.set(k, pr);
+  pr.catch(() => cCache.delete(k));
+  if(cCache.size > 40){ const old = cCache.keys().next().value, op = cCache.get(old); cCache.delete(old); op.then(u => URL.revokeObjectURL(u)).catch(() => {}); }
+  return pr;
+}
+function cloudSay(text, rate, onend){
+  if(!cAudio){ cAudio = new Audio(); cAudio.preload = 'auto'; }
+  if(!cloudSay._unlocked){ cloudSay._unlocked = true; cAudio.src = SILENT; const u = cAudio.play(); if(u) u.catch(() => {}); }   // 在使用者點按當下解鎖，之後才能自動接續播放
+  const token = ++cToken, a = cAudio;
+  let done = false;
+  const fin = err => { if(done) return; done = true; if(onend) onend(err); };
+  const fallback = (why, hard) => {
+    if(token !== cToken) return;
+    a.onended = a.onerror = null;
+    diag.cloud = '失敗：' + why; if(hard) cloudOff = true;
+    toast('雲端語音失敗（' + why + '），改用內建語音。');
+    done = true; if(!sayLocal(text, rate, onend)){ done = false; fin('cloud'); }
+  };
+  cloudGet(text).then(url => {
+    if(token !== cToken) return;
+    a.onended = () => { if(token === cToken) fin(); };
+    a.onerror = () => fallback('無法播放');
+    a.src = url; a.defaultPlaybackRate = rate; a.playbackRate = rate;
+    const pr = a.play();
+    if(pr) pr.then(() => { diag.cloud = '正常'; }).catch(e => fallback(e && e.name === 'NotAllowedError' ? '系統擋下自動播放，請再按一次' : '無法播放'));
+  }).catch(e => {
+    const s = e && e.status;
+    fallback(s === 401 ? '金鑰無效' : s === 429 ? '額度用完或請求太頻繁' : s === 403 ? '金鑰沒有語音合成權限' : s ? '服務回應 ' + s : '連不上服務', s === 401 || s === 403 || s === 429);
+  });
+  return true;
+}
 function cancelSpeech(){
+  cloudStop();
   clearTimeout(sayTimer); sayTimer = 0;
   if(!window.speechSynthesis) return;
   if(speechSynthesis.speaking || speechSynthesis.pending){ speechSynthesis.cancel(); lastCancel = Date.now(); }   // 沒在念就不要 cancel
@@ -493,6 +571,10 @@ function fillVoices(){
   if(IOS && basic) tip.textContent = '目前是基本語音（機械音）。到 iPhone「設定 › 輔助使用 › 語音內容 › 聲音 › 英文」下載標示「高品質」或「優化」的語音（如 Ava、Zoe），重開 App 後在這裡選 ★ 的語音。';
 }
 function say(text, rate, onend){
+  if(cloudReady() && /\s/.test(text.trim())) return cloudSay(text, rate, onend);   // 單字仍用字典錄音／內建語音，省費用也較快
+  return sayLocal(text, rate, onend);
+}
+function sayLocal(text, rate, onend){
   if(!window.speechSynthesis) return false;
   const u = new SpeechSynthesisUtterance(text);
   u.lang = speechLang();
@@ -516,7 +598,7 @@ function say(text, rate, onend){
       if(done || speechSynthesis.speaking) return;
       diag.tts = '沒有啟動'; toast('語音沒有啟動。請到「設定 › 輔助使用 › 語音內容 › 聲音 › 英文」確認已下載英文語音，然後重開 App。', 9000);
     }, 3000);
-    if(IOS && !say._hinted){ say._hinted = true; toast('聽不到聲音？請關閉機身側邊的靜音開關，並調高音量。', 5000); }
+    if(IOS && !say._hinted && $('toast').style.display !== 'block'){ say._hinted = true; toast('聽不到聲音？請關閉機身側邊的靜音開關，並調高音量。', 5000); }
   };
   clearTimeout(sayTimer);
   if(!voices.length) loadVoices();
@@ -546,7 +628,7 @@ function setCur(i){
 function updateReadBtn(){ $('read').textContent = reading ? '⏸ 暫停' : '▶ 朗讀'; }
 function startReading(i){
   if(!pdf) return;
-  if(!window.speechSynthesis){ $('read').textContent = '此瀏覽器不支援朗讀'; return; }
+  if(!window.speechSynthesis && !cloudReady()){ $('read').textContent = '此瀏覽器不支援朗讀'; return; }
   stopSound(); cancelListening();
   if(i != null) readIdx = i;
   reading = true; updateReadBtn();
@@ -567,6 +649,7 @@ async function readNext(){
     if(err){ stopReading(); return; }             // 語音出錯就停下，不要一路翻頁
     readIdx++; readNext();
   });
+  if(cloudReady() && sentences[readIdx + 1]) cloudGet(sentences[readIdx + 1].text).catch(() => {});   // 先合成下一句，減少句間停頓
 }
 function stopReading(){                           // 暫停：保留 readIdx，下次從同一句繼續
   if(!reading) return;
@@ -744,7 +827,7 @@ $('practice').addEventListener('click', e => {
   e.stopPropagation();
   if(e.target.classList.contains('pw')){ if(!listening){ stopSound(); say(e.target.textContent, 0.8); } return; }
 });
-$('pDemo').onclick = () => { cancelListening(); stopSound(); if(!window.speechSynthesis){ toast('這個環境不支援語音朗讀。'); return; } if(sentences[pIdx]) say(sentences[pIdx].text, settings.rate); };
+$('pDemo').onclick = () => { cancelListening(); stopSound(); if(!window.speechSynthesis && !cloudReady()){ toast('這個環境不支援語音朗讀。'); return; } if(sentences[pIdx]) say(sentences[pIdx].text, settings.rate); };
 $('pMic').onclick = () => { if(listening){ if(recOnly) stopRecordOnly(); else { try{ rec.stop(); }catch(e){} } } else startListening(); };
 $('pMine').onclick = () => { if(!myUrl || listening) return; stopSound(); audio = new Audio(myUrl); audio.play().catch(() => {}); };
 $('pPrev').onclick = () => openPractice(pIdx - 1);
@@ -756,11 +839,12 @@ function showDiag(){
   const v = pickVoice();
   $('diag').textContent = '版本 ' + APP_VERSION + '｜' + (STANDALONE ? '主畫面 App' : '瀏覽器分頁') +
     '｜朗讀：' + (window.speechSynthesis ? '有（語音 ' + voices.length + ' 個，使用 ' + (v ? v.name : '系統預設') + '，狀態 ' + diag.tts + '）' : '無') +
+    '｜雲端：' + (settings.cloudOn ? (settings.cloudKey ? (cloudOff ? '已停用（' + (diag.cloud || '') + '）' : (diag.cloud || '未測')) : '未填金鑰') : '未啟用') +
     '｜辨識：' + (SR ? (srBroken ? '有但失敗' : '有') : '無') + '｜錄音：' + (canRec ? '有' : '無');
 }
 $('diagTest').onclick = () => {
-  if(!window.speechSynthesis){ toast('這個環境不支援語音朗讀。'); return; }
-  stopSound(); say('This is a voice test. Can you hear me?', 1, () => showDiag()); setTimeout(showDiag, 3500);
+  if(!window.speechSynthesis && !cloudReady()){ toast('這個環境不支援語音朗讀。'); return; }
+  stopSound(); say('"You came back!" she cried, laughing through her tears. "I thought I had lost you forever."', 1, () => showDiag()); setTimeout(showDiag, 3500);
 };
 window.nrTest = {grade, openPractice, startReading, stopReading, state: () => ({reading, readIdx, pIdx, n: sentences.length, pageNo})};
 
