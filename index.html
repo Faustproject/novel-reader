@@ -128,6 +128,11 @@ button,.btn,.w,.pw{touch-action:manipulation}
   button:hover,.btn:hover{border-color:var(--line)}
   .primary:hover{border-color:var(--accent)}
 }
+#toast{position:fixed;left:50%;transform:translateX(-50%);bottom:calc(18px + env(safe-area-inset-bottom));z-index:30;display:none;
+  max-width:min(92vw,30rem);background:var(--ink);color:var(--paper);border-radius:10px;padding:10px 14px;font-size:14px;line-height:1.5;box-shadow:var(--shadow)}
+body.practising #toast{bottom:auto;top:calc(70px + env(safe-area-inset-top))}
+#diag{margin-top:8px;padding-top:8px;border-top:1px solid var(--line);color:var(--muted);font-size:12px;line-height:1.6;word-break:break-word}
+#diagTest{margin-top:8px;width:100%}
 </style>
 </head>
 <body>
@@ -157,7 +162,11 @@ button,.btn,.w,.pw{touch-action:manipulation}
     <select id="optRate"><option value="0.7">慢</option><option value="0.85">稍慢</option><option value="1">正常</option><option value="1.15">快</option></select>
   </label>
   <label>顯示中文翻譯 <input id="optZh" type="checkbox"></label>
+  <label>跟讀時同時錄音 <input id="optRec" type="checkbox"></label>
+  <button id="diagTest">🔊 測試語音</button>
+  <div id="diag"></div>
 </div>
+<div id="toast"></div>
 
 <main>
   <div id="reader">
@@ -197,12 +206,18 @@ const store = {
   get(k, d){ try{ const v = localStorage.getItem(k); return v == null ? d : JSON.parse(v); }catch(e){ return d; } },
   set(k, v){ try{ localStorage.setItem(k, JSON.stringify(v)); }catch(e){} }
 };
-const settings = Object.assign({autoSpeak:true, accent:'us', zh:true, fontSize:19, rate:0.85}, store.get('nr:settings', {}));
+const settings = Object.assign({autoSpeak:true, accent:'us', zh:true, fontSize:19, rate:0.85, recWithSR: !IOS}, store.get('nr:settings', {}));
+const APP_VERSION = '1.1';
+const STANDALONE = navigator.standalone === true || (window.matchMedia && matchMedia('(display-mode: standalone)').matches);
+const diag = {tts: '未測'};
+let toastTimer = 0;
+function toast(msg, ms){ const t = $('toast'); t.textContent = msg; t.style.display = 'block'; clearTimeout(toastTimer); toastTimer = setTimeout(() => { t.style.display = 'none'; }, ms || 6000); }
 function saveSettings(){ store.set('nr:settings', settings); }
 function applySettings(){
   $('optSpeak').checked = settings.autoSpeak;
   $('optAccent').value = settings.accent;
   $('optZh').checked = settings.zh;
+  $('optRec').checked = !!settings.recWithSR;
   $('optRate').value = String(settings.rate);
   $('reader').style.fontSize = settings.fontSize + 'px';
 }
@@ -210,9 +225,10 @@ $('optRate').onchange = e => { settings.rate = parseFloat(e.target.value) || 0.8
 $('optSpeak').onchange = e => { settings.autoSpeak = e.target.checked; saveSettings(); if(!settings.autoSpeak) stopSound(); };
 $('optAccent').onchange = e => { settings.accent = e.target.value; saveSettings(); };
 $('optZh').onchange = e => { settings.zh = e.target.checked; saveSettings(); };
+$('optRec').onchange = e => { settings.recWithSR = e.target.checked; saveSettings(); };
 $('smaller').onclick = () => { settings.fontSize = Math.max(14, settings.fontSize - 1); saveSettings(); applySettings(); };
 $('bigger').onclick = () => { settings.fontSize = Math.min(32, settings.fontSize + 1); saveSettings(); applySettings(); };
-$('gear').onclick = e => { e.stopPropagation(); $('settings').classList.toggle('open'); };
+$('gear').onclick = e => { e.stopPropagation(); $('settings').classList.toggle('open'); showDiag(); };
 $('settings').onclick = e => e.stopPropagation();
 applySettings();
 
@@ -423,10 +439,15 @@ async function translate(w){
 }
 
 /* ---------- 發音 ---------- */
-let audio = null;
+let audio = null, lastCancel = 0, sayTimer = 0;
+function cancelSpeech(){
+  clearTimeout(sayTimer); sayTimer = 0;
+  if(!window.speechSynthesis) return;
+  if(speechSynthesis.speaking || speechSynthesis.pending){ speechSynthesis.cancel(); lastCancel = Date.now(); }   // 沒在念就不要 cancel
+}
 function stopSound(){
   if(audio){ audio.pause(); audio = null; }
-  if(window.speechSynthesis) speechSynthesis.cancel();
+  cancelSpeech();
 }
 let voices = [];
 function loadVoices(){ if(window.speechSynthesis) voices = speechSynthesis.getVoices() || []; }
@@ -434,6 +455,10 @@ if(window.speechSynthesis){ loadVoices(); speechSynthesis.onvoiceschanged = load
 const speechLang = () => settings.accent === 'uk' ? 'en-GB' : 'en-US';
 function pickVoice(){
   const c = voices.filter(v => (v.lang || '').replace('_', '-') === speechLang());
+  if(IOS){   // iOS 的清單含大量搞怪語音，只挑已知的正常語音，否則交給系統依語言決定
+    const want = settings.accent === 'uk' ? /^(Daniel|Kate|Serena|Arthur|Martha)/ : /^(Samantha|Ava|Allison|Susan|Evan|Nathan|Zoe|Tom)/;
+    return c.find(v => want.test(v.name) && /premium|enhanced/i.test(v.name)) || c.find(v => want.test(v.name)) || null;
+  }
   return c.find(v => /natural/i.test(v.name)) || c.find(v => /google/i.test(v.name)) || c[0] || null;
 }
 function say(text, rate, onend){
@@ -442,9 +467,30 @@ function say(text, rate, onend){
   u.lang = speechLang();
   const v = pickVoice(); if(v) u.voice = v;
   u.rate = rate;
-  if(onend){ u.onend = onend; u.onerror = onend; }
+  let done = false, wd = 0;
+  const fin = err => { if(done) return; done = true; clearTimeout(wd); if(onend) onend(err); };
+  u.onstart = () => { clearTimeout(wd); diag.tts = '正常'; };
+  u.onend = () => fin();
+  u.onerror = e => {
+    const c = (e && e.error) || 'error';
+    if(c === 'canceled' || c === 'interrupted'){ fin(); return; }
+    diag.tts = '錯誤：' + c; toast('語音播放失敗（' + c + '）。'); fin(c);
+  };
   say._keep = u;
-  speechSynthesis.speak(u);
+  const go = () => {
+    sayTimer = 0;
+    try{ speechSynthesis.resume(); }catch(e){}
+    speechSynthesis.speak(u);
+    wd = setTimeout(() => {
+      if(done || speechSynthesis.speaking) return;
+      diag.tts = '沒有啟動'; toast('語音沒有啟動。請到「設定 › 輔助使用 › 語音內容 › 聲音 › 英文」確認已下載英文語音，然後重開 App。', 9000);
+    }, 3000);
+    if(IOS && !say._hinted){ say._hinted = true; toast('聽不到聲音？請關閉機身側邊的靜音開關，並調高音量。', 5000); }
+  };
+  clearTimeout(sayTimer);
+  if(!voices.length) loadVoices();
+  const wait = 300 - (Date.now() - lastCancel);
+  if(wait > 0) sayTimer = setTimeout(go, wait); else go();
   return true;
 }
 function tts(word){ return say(word, 0.9); }
@@ -485,22 +531,26 @@ async function readNext(){
     readIdx = 0;
   }
   setCur(readIdx);
-  say(sentences[readIdx].text, settings.rate, () => {
+  say(sentences[readIdx].text, settings.rate, err => {
     if(token !== readToken || !reading) return;
+    if(err){ stopReading(); return; }             // 語音出錯就停下，不要一路翻頁
     readIdx++; readNext();
   });
 }
 function stopReading(){                           // 暫停：保留 readIdx，下次從同一句繼續
   if(!reading) return;
   reading = false; readToken++;
-  if(window.speechSynthesis) speechSynthesis.cancel();
+  cancelSpeech();
   updateReadBtn();
 }
 $('read').onclick = e => { e.stopPropagation(); hideCard(); reading ? stopReading() : startReading(); };
 
 /* ---------- 跟讀：使用者念，標出沒被聽清楚的字 ---------- */
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-let rec = null, listening = false, pIdx = 0, pTokens = [];
+let rec = null, listening = false, pIdx = 0, pTokens = [], srBroken = false, recOnly = false;
+const canRec = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia && window.MediaRecorder);
+const canSR = () => !!SR && !srBroken;
+const REC_ONLY_MSG = '這裡無法使用語音辨識，所以不會評分。按「開始念」錄下自己的聲音，再用「聽我念的」和「聽示範」對照。' + (IOS && STANDALONE ? '（要評分請改用 Safari 開啟同一個網址。）' : '');
 const SAME = {mister: 'mr', missus: 'mrs', misses: 'mrs', doctor: 'dr', saint: 'st', okay: 'ok'};
 const norm = t => { const k = t.toLowerCase().replace(/’/g, "'").replace(/[^a-z0-9']/g, ''); return SAME[k] || k; };
 const SR_ERR = {
@@ -532,8 +582,8 @@ function openPractice(i){
   $('pScore').textContent = '';
   if(myUrl){ URL.revokeObjectURL(myUrl); myUrl = ''; }
   $('pMine').disabled = true;
-  $('pHeard').textContent = SR ? '按「開始念」，把這一句念出來，念完按「念完了」。' : (IOS ? '這個環境不支援語音辨識：請用 Safari 開啟，並在「設定 › 一般 › 鍵盤」開啟「啟用聽寫」。' : '這個瀏覽器不支援語音辨識，請改用 Chrome 或 Edge。');
-  $('pMic').disabled = !SR;
+  $('pHeard').textContent = canSR() ? '按「開始念」，把這一句念出來，念完按「念完了」。' : canRec ? REC_ONLY_MSG : '這個環境不支援語音辨識，也不支援錄音。';
+  $('pMic').disabled = !(canSR() || canRec);
   $('pPrev').disabled = pIdx <= 0; $('pNext').disabled = pIdx >= sentences.length - 1;
   updateMic();
   $('practice').classList.add('open'); document.body.classList.add('practising');
@@ -547,17 +597,17 @@ function closePractice(){
 }
 function cancelListening(){                       // 放棄這次錄音，不評分
   if(rec){ const r = rec; rec = null; r.onend = r.onresult = r.onerror = null; try{ r.abort(); }catch(e){} }
-  listening = false; updateMic(); stopRecording();
+  listening = false; recOnly = false; updateMic(); stopRecording();
 }
 /* 同時錄下使用者的聲音，念完可回放，和示範對照 */
 let mediaRec = null, myUrl = '';
-const REC_WITH_SR = true;   // 若實機上「錄音」與「語音辨識」搶麥克風導致跟讀失敗，改成 false（會失去「聽我念的」）
 async function startRecording(){
-  if(!REC_WITH_SR || !navigator.mediaDevices || !window.MediaRecorder) return;
-  let stream;
-  try{ stream = await navigator.mediaDevices.getUserMedia({audio: true}); }catch(e){ return; }
-  if(!listening){ stream.getTracks().forEach(t => t.stop()); return; }
-  const mr = new MediaRecorder(stream), chunks = [];
+  if(!canRec) return false;
+  let stream, mr;
+  try{ stream = await navigator.mediaDevices.getUserMedia({audio: true}); }catch(e){ return false; }
+  if(!listening){ stream.getTracks().forEach(t => t.stop()); return true; }
+  try{ mr = new MediaRecorder(stream); }catch(e){ stream.getTracks().forEach(t => t.stop()); return false; }
+  const chunks = [];
   mr.ondataavailable = e => { if(e.data && e.data.size) chunks.push(e.data); };
   mr.onstop = () => {
     stream.getTracks().forEach(t => t.stop());
@@ -568,35 +618,59 @@ async function startRecording(){
     $('pMine').disabled = false;
   };
   mediaRec = mr; mr.start();
+  return true;
 }
 function stopRecording(){ if(mediaRec && mediaRec.state !== 'inactive'){ try{ mediaRec.stop(); }catch(e){} } }
+async function startRecordOnly(){
+  stopSound(); stopReading(); cancelListening();
+  for(const t of pTokens) t.el.classList.remove('ok', 'bad', 'unsure');
+  $('pScore').textContent = ''; $('pHeard').textContent = '錄音中…念完按「念完了」。';
+  listening = true; recOnly = true; updateMic();
+  const ok = await startRecording();
+  if(!ok && recOnly){
+    listening = false; recOnly = false; updateMic();
+    $('pHeard').textContent = '無法使用麥克風。請在詢問時按「允許」，或到「設定 › App › Safari › 麥克風」開放後再試。';
+  }
+}
+function stopRecordOnly(){
+  listening = false; recOnly = false; updateMic(); stopRecording();
+  $('pHeard').textContent = '錄好了。按「聽我念的」回放，再按「聽示範」對照。';
+}
 function startListening(){
-  if(!SR) return;
+  if(!canSR()){ if(canRec) startRecordOnly(); return; }
   stopSound(); stopReading(); cancelListening();
   const r = new SR();
   r.lang = speechLang(); r.interimResults = true; r.continuous = true; r.maxAlternatives = 1;
-  let finals = [], err = '';
+  let finals = [], err = '', errCode = '', lastInterim = '';
   r.onresult = e => {
     let interim = ''; finals = [];
     for(let i = 0; i < e.results.length; i++){
       const res = e.results[i];
       if(res.isFinal) finals.push({text: res[0].transcript, conf: res[0].confidence || 0}); else interim += res[0].transcript;
     }
+    lastInterim = interim;
     const top = finals.map(f => f.text).join(' ');
     $('pHeard').textContent = '聽到：' + (top + ' ' + interim).trim();
     if(top.split(/\s+/).filter(Boolean).length >= pTokens.length){ try{ r.stop(); }catch(x){} }  // 整句念完自動結束
   };
-  r.onerror = e => { if(e.error !== 'aborted') err = SR_ERR[e.error] || ('語音辨識發生問題（' + e.error + '）。'); };
+  r.onerror = e => { if(e.error !== 'aborted'){ errCode = e.error; err = SR_ERR[e.error] || ('語音辨識發生問題（' + e.error + '）。'); } };
   r.onend = () => {
     if(rec !== r) return;
     rec = null; listening = false; updateMic(); stopRecording();
-    if(err && !finals.length) $('pHeard').textContent = err; else grade(finals);
+    if(!finals.length && lastInterim.trim()) finals = [{text: lastInterim, conf: 0}];   // iOS 有時不給 final 結果
+    if(err && !finals.length){
+      if(errCode === 'service-not-allowed' && canRec){ srBroken = true; $('pHeard').textContent = '語音辨識在這裡無法使用。' + REC_ONLY_MSG; }
+      else $('pHeard').textContent = err;
+    } else grade(finals);
   };
   for(const t of pTokens) t.el.classList.remove('ok', 'bad', 'unsure');
   $('pScore').textContent = ''; $('pHeard').textContent = '請開始念…';
-  try{ r.start(); }catch(x){ $('pHeard').textContent = '無法啟動麥克風。'; return; }
+  try{ r.start(); }catch(x){
+    if(canRec){ srBroken = true; $('pHeard').textContent = '語音辨識無法啟動。' + REC_ONLY_MSG; } else $('pHeard').textContent = '無法啟動麥克風。';
+    return;
+  }
   rec = r; listening = true; updateMic();
-  startRecording();
+  if(settings.recWithSR) startRecording();
 }
 /* 以最長共同子序列對齊「原句的字」與「聽到的字」，回傳原句每個字是否被聽到 */
 function lcsMatch(a, b){
@@ -639,13 +713,24 @@ $('practice').addEventListener('click', e => {
   e.stopPropagation();
   if(e.target.classList.contains('pw')){ if(!listening){ stopSound(); say(e.target.textContent, 0.8); } return; }
 });
-$('pDemo').onclick = () => { cancelListening(); stopSound(); if(sentences[pIdx]) say(sentences[pIdx].text, settings.rate); };
-$('pMic').onclick = () => { if(listening){ try{ rec.stop(); }catch(e){} } else startListening(); };
+$('pDemo').onclick = () => { cancelListening(); stopSound(); if(!window.speechSynthesis){ toast('這個環境不支援語音朗讀。'); return; } if(sentences[pIdx]) say(sentences[pIdx].text, settings.rate); };
+$('pMic').onclick = () => { if(listening){ if(recOnly) stopRecordOnly(); else { try{ rec.stop(); }catch(e){} } } else startListening(); };
 $('pMine').onclick = () => { if(!myUrl || listening) return; stopSound(); audio = new Audio(myUrl); audio.play().catch(() => {}); };
 $('pPrev').onclick = () => openPractice(pIdx - 1);
 $('pNext').onclick = () => openPractice(pIdx + 1);
 $('pClose').onclick = closePractice;
 $('prac').onclick = e => { e.stopPropagation(); openPractice(readIdx < sentences.length ? readIdx : 0); };
+function showDiag(){
+  loadVoices();
+  const v = pickVoice();
+  $('diag').textContent = '版本 ' + APP_VERSION + '｜' + (STANDALONE ? '主畫面 App' : '瀏覽器分頁') +
+    '｜朗讀：' + (window.speechSynthesis ? '有（語音 ' + voices.length + ' 個，使用 ' + (v ? v.name : '系統預設') + '，狀態 ' + diag.tts + '）' : '無') +
+    '｜辨識：' + (SR ? (srBroken ? '有但失敗' : '有') : '無') + '｜錄音：' + (canRec ? '有' : '無');
+}
+$('diagTest').onclick = () => {
+  if(!window.speechSynthesis){ toast('這個環境不支援語音朗讀。'); return; }
+  stopSound(); say('This is a voice test. Can you hear me?', 1, () => showDiag()); setTimeout(showDiag, 3500);
+};
 window.nrTest = {grade, openPractice, startReading, stopReading, state: () => ({reading, readIdx, pIdx, n: sentences.length, pageNo})};
 
 /* ---------- 字典卡 ---------- */
@@ -767,7 +852,9 @@ document.addEventListener('click', () => { hideCard(); $('settings').classList.r
 window.addEventListener('resize', placeCard);
 })();
 if('serviceWorker' in navigator && /^https?:$/.test(location.protocol)){
-  window.addEventListener('load', () => navigator.serviceWorker.register('sw.js').catch(() => {}));
+  const hadSW = !!navigator.serviceWorker.controller; let reloaded = false;
+  navigator.serviceWorker.addEventListener('controllerchange', () => { if(hadSW && !reloaded){ reloaded = true; location.reload(); } });   // 有新版就自動換上
+  window.addEventListener('load', () => navigator.serviceWorker.register('sw.js').then(r => r.update()).catch(() => {}));
 }
 </script>
 </body>
